@@ -1,0 +1,26 @@
+# CMake / build
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+*.cmake
+compile_commands.json
+
+# 编译产物
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# 临时/本地
+.vscode/
+.idea/
+.DS_Store
+
+# 运行时生成
+anim_frames/
+path_animation.gif
+
