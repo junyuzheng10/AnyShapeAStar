@@ -35,13 +35,14 @@ public:
   }
 
   /**
-   * 碰撞检测：把形状以 (cx,cy) 为形心、yaw_rad 朝向放置到 map_bin 上，检测与障碍是否重叠
-   * @param map_bin  单通道 8U：0=空闲，>0=障碍
-   * @return true 表示碰撞；false 表示无碰撞
+   * 间隙查询：把形状以 (cx,cy) 为形心、yaw_rad 朝向放置到地图上，
+   * 返回足迹内像素到最近障碍的最小距离（像素，基于预计算的 dist 距离场）。
+   * @param dist  距离场（GridMap::computeDistanceField 生成）
+   * @return 最小间隙；0 表示碰撞（足迹压到障碍或越界）
    */
-  bool collidesAt(const cv::Mat& map_bin, int cx, int cy,
-                  double yaw_rad, double meter_per_pixel,
-                  cv::Rect* out_roi_debug = nullptr) const
+  double clearanceAt(const cv::Mat& map_bin, const cv::Mat& dist,
+                     int cx, int cy,
+                     double yaw_rad, double meter_per_pixel) const
   {
     // 1) 旋转到像素坐标（形心为原点）
     auto outer_pix = rotateToPixels(outer_m_, yaw_rad, meter_per_pixel);
@@ -56,11 +57,11 @@ public:
     for (auto& hp : holes_pix) bbox |= cv::boundingRect(hp);
     cv::Rect roi(bbox.x + cx, bbox.y + cy, bbox.width, bbox.height);
 
-    // 越界直接视作碰撞（也可裁剪处理）
+    // 越界视作碰撞（间隙为 0）
     if (roi.x < 0 || roi.y < 0 ||
         roi.x + roi.width > map_bin.cols ||
         roi.y + roi.height > map_bin.rows)
-      return true;
+      return 0.0;
 
     // 3) 在 ROI 内绘制外轮廓填充，再用 0 抠出内孔
     cv::Mat shapeMask = cv::Mat::zeros(roi.height, roi.width, CV_8UC1);
@@ -78,11 +79,10 @@ public:
       cv::fillPoly(shapeMask, holev, cv::Scalar(0));
     }
 
-    // 4) 与地图 ROI 做按位与，若重叠非零则碰撞
-    cv::Mat overlap;
-    cv::bitwise_and(shapeMask, map_bin(roi), overlap);
-    if (out_roi_debug) *out_roi_debug = roi;
-    return cv::countNonZero(overlap) > 0;
+    // 4) 足迹内距离场最小值 = 车体上离障碍最近的点
+    double minD = 0.0;
+    cv::minMaxIdx(dist(roi), &minD, nullptr, nullptr, nullptr, shapeMask);
+    return minD;
   }
 
   // ------------------- 工具：构造 F / A 放大形状（单位：米） -------------------
@@ -144,6 +144,171 @@ static PolygonalShape MakeF(double w, double h, double t,
   s.outer_m_ = std::move(P);
   return s;
 }
+
+  // 车辆侧影（俯视平面形状）：尾部高竖鳍 + 底部长条 + 前部甲板 + 甲板上的凸块
+  // 单位：米。局部原点在尾鳍根部（后下角），x 向前，y 向下（图像约定，上方为 -y）
+  // L: 总长; h_fin: 尾鳍总高（≈走廊宽，直立刚好能开）; h_body: 车体总高（≈凸块上方间隙）; t: 笔画厚
+  static PolygonalShape MakeVehicle(double L, double h_fin, double h_body, double t)
+  {
+    const double x_deck = L * 0.40;   // 甲板起点（前部 60% 抬高）
+    const double x_b0   = L * 0.68;   // 凸块后缘
+    const double x_b1   = L * 0.80;   // 凸块前缘
+    const double h_deck = h_body - t; // 甲板高（凸块再高出 t）
+
+    PolygonalShape s;
+    std::vector<Eigen::Vector2d> P = {
+      {0, 0},            // 后下角（鳍根）
+      {L, 0},            // 车头底角
+      {L, -h_deck},      // 车头立面到甲板顶
+      {x_b1, -h_deck},   // 甲板顶左行到凸块右缘
+      {x_b1, -h_body},   // 凸块右缘上行
+      {x_b0, -h_body},   // 凸块顶左行
+      {x_b0, -h_deck},   // 凸块左缘下行
+      {x_deck, -h_deck}, // 甲板顶左行到甲板左缘
+      {x_deck, -t},      // 甲板左缘下行到底条顶
+      {t, -t},           // 底条顶左行到鳍右缘
+      {t, -h_fin},       // 鳍右缘上行
+      {0, -h_fin},       // 鳍顶
+    };
+    s.outer_m_ = std::move(P);
+    return s;
+  }
+
+  // 竖直线段（最简运动物体）：一条高 h、厚 t 的细竖条，中心在原点
+  // h≈走廊宽（两边间距），直立时上下各留少量间隙
+  static PolygonalShape MakeVLine(double h, double t)
+  {
+    PolygonalShape s;
+    std::vector<Eigen::Vector2d> P = {
+      {0, -h/2}, {t, -h/2}, {t, h/2}, {0, h/2},
+    };
+    s.outer_m_ = std::move(P);
+    return s;
+  }
+
+  // 竖线 + 从竖线中心向右伸出的横线（“⊢”形）：竖线高 h，横线长 len，
+  // 笔画厚 t，整体中心在原点（竖线中心与横线左端同高）
+  static PolygonalShape MakeVHLine(double h, double len, double t)
+  {
+    PolygonalShape s;
+    std::vector<Eigen::Vector2d> P = {
+      {0, -h/2}, {t, -h/2}, {t, -t/2}, {len, -t/2},
+      {len,  t/2}, {t,  t/2}, {t,  h/2}, {0,  h/2},
+    };
+    s.outer_m_ = std::move(P);
+    return s;
+  }
+
+  // 竖线 + 右伸横线 + 横线右端上方的方形框（空心，壁厚 t）：
+  // 方框底边贴横线上缘。框高受两处约束：走廊巡航（框顶≥上墙下缘+1 且竖线底≤下墙上缘-1）
+  // 与窄缝窗口（框+横线总高 ≤ 48px）
+  static PolygonalShape MakeVHLineBox(double h, double len, double box_w, double box_h, double t)
+  {
+    PolygonalShape s;
+    const double yTop = -t/2 - box_h;   // 方框顶（横线上方，y 向下为正）
+    std::vector<Eigen::Vector2d> P = {
+      {0,  h/2}, {t,  h/2}, {t,  t/2}, {len,  t/2},
+      {len, yTop}, {len - box_w, yTop},
+      {len - box_w, -t/2}, {t, -t/2}, {t, -h/2}, {0, -h/2},
+    };
+    s.outer_m_ = std::move(P);
+    // 方框内孔（四壁厚 t）
+    std::vector<Eigen::Vector2d> hole = {
+      {len - box_w + t, yTop + t}, {len - t, yTop + t},
+      {len - t, -t/2 - t}, {len - box_w + t, -t/2 - t},
+    };
+    s.holes_m_.push_back(std::move(hole));
+    return s;
+  }
+
+  // 竖线 + 右伸横线 + 横线上两个骑跨框（均空心、壁厚 t）：
+  //   大方框 box_w×box_h 紧贴横线右端上方；
+  //   矮矩形框 rect_w×rect_h 位于其左侧（左缘 rect_x0），底边同贴横线上缘
+  static PolygonalShape MakeVHLineTwoBox(double h, double len,
+                                         double box_w, double box_h,
+                                         double rect_x0, double rect_w, double rect_h,
+                                         double t)
+  {
+    PolygonalShape s;
+    const double boxTop  = -t/2 - box_h;    // 大方框顶
+    const double rectTop = -t/2 - rect_h;   // 矮框顶
+    const double rectX1  = len - box_w;     // 矮框右缘（与大框左缘齐平）
+    std::vector<Eigen::Vector2d> P = {
+      {0, h/2}, {t, h/2}, {t, t/2}, {len, t/2},
+      {len, boxTop}, {len - box_w, boxTop},
+      {rectX1, rectTop}, {rect_x0, rectTop},
+      {rect_x0, -t/2}, {t, -t/2}, {t, -h/2}, {0, -h/2},
+    };
+    s.outer_m_ = std::move(P);
+    // 大方框内孔
+    s.holes_m_.push_back({
+      {len - box_w + t, boxTop + t}, {len - t, boxTop + t},
+      {len - t, -t/2 - t}, {len - box_w + t, -t/2 - t},
+    });
+    // 矮框内孔
+    s.holes_m_.push_back({
+      {rect_x0 + t, rectTop + t}, {rectX1 - t, rectTop + t},
+      {rectX1 - t, -t/2 - t}, {rect_x0 + t, -t/2 - t},
+    });
+    return s;
+  }
+
+  // 竖杆（下段 h_below、上段 h_above，宽 mast_w 可不对称加宽）+ 右伸横线
+  // + 横线上矮矩形（贯通到右端）+ 中部加高框（“低-高-低”轮廓）：均空心、壁厚 t
+  // 注：杆加宽后倾斜过缝的竖向投影 = 杆长·cosθ + 杆宽·sinθ，倾角需求随宽度增大
+  static PolygonalShape MakeVHLineHump(double h_below, double h_above, double len,
+                                       double mast_w,
+                                       double rect_x0, double rect_h,
+                                       double box_x0, double box_x1, double box_h,
+                                       double t)
+  {
+    PolygonalShape s;
+    const double rectTop = -t/2 - rect_h;   // 矮矩形顶
+    const double boxTop  = -t/2 - box_h;    // 加高框顶
+    std::vector<Eigen::Vector2d> P = {
+      {0, h_below}, {mast_w, h_below}, {mast_w, t/2}, {len, t/2},
+      {len, rectTop}, {box_x1, rectTop}, {box_x1, boxTop},
+      {box_x0, boxTop}, {box_x0, rectTop}, {rect_x0, rectTop},
+      {rect_x0, -t/2}, {mast_w, -t/2}, {mast_w, -h_above}, {0, -h_above},
+    };
+    s.outer_m_ = std::move(P);
+    // 矮矩形内孔（被加高框分成左右两段）
+    s.holes_m_.push_back({
+      {rect_x0 + t, rectTop + t}, {box_x0 - t, rectTop + t},
+      {box_x0 - t, -t/2 - t}, {rect_x0 + t, -t/2 - t},
+    });
+    s.holes_m_.push_back({
+      {box_x1 + t, rectTop + t}, {len - t, rectTop + t},
+      {len - t, -t/2 - t}, {box_x1 + t, -t/2 - t},
+    });
+    // 加高框内孔
+    s.holes_m_.push_back({
+      {box_x0 + t, boxTop + t}, {box_x1 - t, boxTop + t},
+      {box_x1 - t, -t/2 - t}, {box_x0 + t, -t/2 - t},
+    });
+    return s;
+  }
+
+  // L 形（竖干在左、底横笔向右）：宽 w、高 h、笔画厚度 t
+  static PolygonalShape MakeL(double w, double h, double t)
+  {
+    const double xL = -w/2, xR = +w/2;
+    const double yB = -h/2, yT = +h/2;
+
+    PolygonalShape s;
+    // 注意：像素/图像坐标系 y 轴向下，“底部横笔”须放在 +y（yT）一侧
+    // 外轮廓：左缘上行 -> 竖干顶边右行 -> 竖干内缘下行 -> 横笔上缘右行 -> 横笔右缘下行 -> 底边左行闭合
+    std::vector<Eigen::Vector2d> P = {
+      {xL, yT},
+      {xL, yB},
+      {xL + t, yB},
+      {xL + t, yT - t},
+      {xR, yT - t},
+      {xR, yT},
+    };
+    s.outer_m_ = std::move(P);
+    return s;
+  }
 
   // 放大 A（可带三角孔）
   static PolygonalShape MakeA(double w, double h, double t, bool with_hole=true)
