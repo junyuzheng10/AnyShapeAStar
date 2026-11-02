@@ -109,9 +109,12 @@ int main() {
   // GIF 导出参数
   const bool save_gif = true;               // 开启/关闭 GIF 生成
   const int gif_fps   = 30;                 // 帧率
-  const int frame_stride = 1;               // 每多少个路径点存一帧（1 = 每点都存）
   const std::string frames_dir = "anim_frames"; // 相对运行目录（通常是 build/）
   const std::string gif_out   = "path_animation.gif";
+
+  // line-of-sight 剪枝（仿 ik_test astar.shortcut 配置：消阶梯锯齿）
+  const bool   shortcut_enable     = true;
+  const double shortcut_margin_pix = 1.0;
 
    // ===== 地图 =====
   GridMap gm(W, H, mpp);
@@ -225,6 +228,14 @@ int main() {
     return 0;
   }
 
+  // —— line-of-sight 剪枝（贪心保留最远可视点，消阶梯锯齿）——
+  if (shortcut_enable) {
+    const auto raw = path;
+    path = planner.shortcutPath(path, shortcut_margin_pix);
+    std::cout << "[astar] shortcut 剪枝: " << raw.size() << " -> "
+              << path.size() << " 状态" << std::endl;
+  }
+
   // —— 最终结果图（静态展示）——
   cv::Mat final_img = base.clone();
   for (size_t i=1;i<path.size();++i) {
@@ -243,7 +254,7 @@ int main() {
   cv::imwrite("final_state.png", final_img);
   std::cout << "[png] 已保存结束状态: final_state.png" << std::endl;
 
-  // —— 生成动画帧（沿路径逐步增长）——
+  // —— 生成动画帧（时间插值：沿路径恒速均匀回放）——
   if (save_gif) {
     clearOldFrames(frames_dir); // 先清掉上次运行残留的旧帧，避免 GIF 结尾混入旧画面
     if (!ensureDir(frames_dir)) {
@@ -251,43 +262,53 @@ int main() {
     } else {
       int frame_idx = 0;
       cv::Mat frame;
-      const double rot_cap_deg = 1.0;  // 每帧最大旋转角（度）：动画转速上限，调小则旋转更慢
-      double prev_yaw = (2.0 * M_PI / planner.theta_bins) * path[0].z();
+      // 插值速率上限：平移每帧 ≤1px，旋转每帧 ≤rot_cap_deg 度（与原逐节点回放观感一致）
+      const double rot_cap_deg = 1.0;
+      const double deg_per_bin = 360.0 / planner.theta_bins;
 
-      for (size_t k=1; k<path.size(); ++k) {
-        if (k % frame_stride != 0 && k+1 < path.size()) continue;
-
-        // 旋转步骤按 rot_cap_deg/帧 插值拆帧，限制动画最高角速度（值越小旋转越慢）；
-        // 平移步骤保持每节点 1 帧
-        const double yaw = (2.0 * M_PI / planner.theta_bins) * path[k].z();
-        double dyaw = std::atan2(std::sin(yaw - prev_yaw), std::cos(yaw - prev_yaw));
-        int rot_sub = 1;
-        if (std::abs(dyaw) > 1e-9) {
-          rot_sub = std::max(1, (int)std::ceil(std::abs(dyaw) * 180.0 / M_PI / rot_cap_deg));
+      // 存一帧：已走完整段 + 当前段的部分线（剪枝后节点稀疏，段内插值逐步生长）
+      auto emitFrame = [&](size_t seg, double px, double py, double yaw) {
+        frame = base.clone();
+        for (size_t i=1; i<=seg; ++i) {
+          cv::line(frame,
+                   {path[i-1].x(), path[i-1].y()},
+                   {path[i].x(),   path[i].y()},
+                   {0,0,255}, 2);
         }
-
-        for (int sub = 1; sub <= rot_sub; ++sub) {
-          frame = base.clone();
-
-          // 画从起点到第 k 段的路径
-          for (size_t i=1; i<=k; ++i) {
-            cv::line(frame,
-                     {path[i-1].x(), path[i-1].y()},
-                     {path[i].x(),   path[i].y()},
-                     {0,0,255}, 2);
-          }
-
-          // 当前姿态下画机器人形状（描边）；旋转帧取插值角度
-          const double yaw_i = (rot_sub == 1) ? yaw : prev_yaw + dyaw * sub / rot_sub;
-          drawAgentAt(frame, agent, yaw_i, path[k].x(), path[k].y(),
-                      gm.meter_per_pixel, /*color=*/{50,180,255}, /*thick=*/2);
-
-          // 保存 PNG 帧（零填充编号以保证字典序）
-          char namebuf[256];
-          std::snprintf(namebuf, sizeof(namebuf), "%s/frame_%05d.png", frames_dir.c_str(), frame_idx++);
-          cv::imwrite(namebuf, frame);
+        const int ix = (int)std::lround(px), iy = (int)std::lround(py);
+        if (seg > 0) {
+          cv::line(frame, {path[seg-1].x(), path[seg-1].y()}, {ix, iy},
+                   {0,0,255}, 2);
         }
-        prev_yaw = yaw;
+        // 当前插值状态画机器人形状（描边）
+        drawAgentAt(frame, agent, yaw, ix, iy,
+                    gm.meter_per_pixel, /*color=*/{50,180,255}, /*thick=*/2);
+        // 保存 PNG 帧（零填充编号以保证字典序）
+        char namebuf[256];
+        std::snprintf(namebuf, sizeof(namebuf), "%s/frame_%05d.png", frames_dir.c_str(), frame_idx++);
+        cv::imwrite(namebuf, frame);
+      };
+
+      emitFrame(0, path[0].x(), path[0].y(),
+                (2.0*M_PI/planner.theta_bins)*path[0].z()); // 起点帧
+
+      // 段内 (x,y,th) 线性插值（th 走最短环绕，平移/旋转复合运动）：
+      // 子步数 n = max(平移像素, 旋转帧数) → 平移 1px/帧、旋转 rot_cap_deg/帧
+      for (size_t s=1; s<path.size(); ++s) {
+        const Eigen::Vector3i& a = path[s-1];
+        const Eigen::Vector3i& b = path[s];
+        const int bins = planner.theta_bins;
+        const int dth = (((b.z()-a.z() + bins/2) % bins) + bins) % bins - bins/2;
+        const int n = (int)std::max(
+            std::hypot(double(b.x()-a.x()), double(b.y()-a.y())),
+            std::abs(dth) * deg_per_bin / rot_cap_deg);
+        for (int k=1; k<=n; ++k) {
+          const double u = a.x() + (b.x()-a.x())*k/(double)n;
+          const double v = a.y() + (b.y()-a.y())*k/(double)n;
+          double thm = std::fmod(a.z() + dth*k/(double)n, bins);
+          if (thm < 0) thm += bins;
+          emitFrame(s, u, v, (2.0*M_PI/bins)*thm);
+        }
       }
 
       // 合成为 GIF

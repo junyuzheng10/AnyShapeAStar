@@ -170,6 +170,53 @@ struct AnyShapeAStar {
     return w_time * (d + w_yaw*std::abs(dth)*(static_cast<double>(theta_bins)/(2.0*M_PI)));
   }
 
+  // ===== line-of-sight 剪枝（仿 ik_test astar_cart_interp_demo.shortcut_path）=====
+  // 贪心保留最远可视点，消除 A* 阶梯锯齿：段内 (x,y,th) 线性插值
+  // （th 走最短环绕，平移/旋转复合运动），逐像素步进查 clearance，
+  // 余量 <= margin_pix 视为不可视。端点由规划保证无碰不复查；
+  // 相邻状态剪枝失败时原样保留（退化 = 原序列，不会更差）。
+  static int pyRound(double v) {  // Python round 语义：.5 取偶
+    const double f = std::floor(v);
+    const double d = v - f;
+    if (d > 0.5) return (int)f + 1;
+    if (d < 0.5) return (int)f;
+    return ((int)f % 2 == 0) ? (int)f : (int)f + 1;
+  }
+
+  std::vector<Eigen::Vector3i> shortcutPath(
+      const std::vector<Eigen::Vector3i>& path, double margin_pix = 1.0)
+  {
+    if (path.size() <= 2) return path;
+    const int bins = theta_bins;
+
+    auto segOk = [&](const Eigen::Vector3i& a, const Eigen::Vector3i& b) {
+      const int dth = (((b.z() - a.z() + bins / 2) % bins) + bins) % bins
+                      - bins / 2;
+      const int n = (int)std::max(
+          std::hypot(double(b.x() - a.x()), double(b.y() - a.y())),
+          (double)std::max(std::abs(dth), 1));
+      for (int k = 1; k < n; ++k) {
+        const int u = pyRound(a.x() + (b.x() - a.x()) * k / (double)n);
+        const int v = pyRound(a.y() + (b.y() - a.y()) * k / (double)n);
+        double thm = std::fmod(a.z() + dth * k / (double)n, bins);
+        if (thm < 0) thm += bins;
+        const int th = pyRound(thm) % bins;
+        if (clearance(u, v, th) <= margin_pix) return false;
+      }
+      return true;
+    };
+
+    std::vector<Eigen::Vector3i> out{path.front()};
+    size_t i = 0;
+    while (i + 1 < path.size()) {
+      size_t j = path.size() - 1;
+      while (j > i + 1 && !segOk(path[i], path[j])) --j;
+      out.push_back(path[j]);
+      i = j;
+    }
+    return out;
+  }
+
   std::vector<Eigen::Vector3i> plan(
       Eigen::Vector3i start,
       Eigen::Vector3i goal)
