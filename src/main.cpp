@@ -99,26 +99,27 @@ static void clearOldFrames(const std::string& path) {
   ::closedir(dir);
 }
 
-// —— 从 PNG 合成为 GIF（优先 ffmpeg，次选 convert）——
+// —— 从 PNG 合成为 GIF（优先 ffmpeg，次选 convert；命令输出静默）——
 static bool makeGifFromPngs(const std::string& frames_dir,
                             const std::string& out_gif,
                             int fps = 15)
 {
   if (commandExists("ffmpeg")) {
+    // 裁剪版 ffmpeg 可能缺 palette 系滤镜：静默执行，失败时回落 convert
     std::string cmd =
       "ffmpeg -y -framerate " + std::to_string(fps) +
       " -i " + frames_dir + "/frame_%05d.png "
       "-filter_complex \"fps=" + std::to_string(fps) +
-      ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse\" " + out_gif;
-    std::cout << "[gif] run: " << cmd << std::endl;
+      ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse\" " + out_gif +
+      " > /dev/null 2>&1";
     return (std::system(cmd.c_str()) == 0);
   }
   if (commandExists("convert")) {
     int delay_cs = 100 / fps; // 1/100 秒为单位的帧延时
     std::string cmd =
       "convert -delay " + std::to_string(delay_cs) +
-      " -loop 0 " + frames_dir + "/frame_*.png " + out_gif;
-    std::cout << "[gif] run: " << cmd << std::endl;
+      " -loop 0 " + frames_dir + "/frame_*.png " + out_gif +
+      " > /dev/null 2>&1";
     return (std::system(cmd.c_str()) == 0);
   }
   std::cerr << "[gif] 未找到 ffmpeg 或 convert，已保存 PNG 帧在目录：" << frames_dir << std::endl;
