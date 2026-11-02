@@ -41,6 +41,33 @@ static void drawAgentAt(cv::Mat& vis,
   }
 }
 
+// —— 在图像上画出机器人外层连通的离散点云（不画多边形边线）——
+// 与软惩罚同源：栅格化实心足迹后取 RETR_EXTERNAL 外轮廓全像素，
+// 逐点画实心小圆点
+static void drawAgentCloudAt(cv::Mat& vis,
+                             const PolygonalShape& agent,
+                             double yaw_rad,
+                             int cx, int cy,
+                             double meter_per_pixel,
+                             const cv::Scalar& color = {50,180,255},
+                             int dot_radius = 0)
+{
+  auto outer = PolygonalShape::rotateToPixels(agent.outer_m_, yaw_rad, meter_per_pixel);
+  std::vector<cv::Point> outer_img; outer_img.reserve(outer.size());
+  for (auto&p: outer) outer_img.emplace_back(p.x + cx, p.y + cy);
+  const cv::Rect bbox = cv::boundingRect(outer_img);
+  cv::Mat m = cv::Mat::zeros(bbox.height, bbox.width, CV_8UC1);
+  std::vector<cv::Point> local; local.reserve(outer_img.size());
+  for (auto&p: outer_img) local.emplace_back(p.x - bbox.x, p.y - bbox.y);
+  const std::vector<std::vector<cv::Point>> polys{local};
+  cv::fillPoly(m, polys, cv::Scalar(255));
+  std::vector<std::vector<cv::Point>> cs;
+  cv::findContours(m, cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+  for (auto& c : cs)
+    for (auto& p : AnyShapeAStar::thinContour(c)) // 同惩罚点云：删除邻近像素
+      cv::circle(vis, {p.x + bbox.x, p.y + bbox.y}, dot_radius, color, -1);
+}
+
 // —— 检查命令是否可用（用于选择 convert/ffmpeg）——
 static bool commandExists(const std::string& cmd) {
   std::string check = "which " + cmd + " > /dev/null 2>&1";
@@ -110,7 +137,9 @@ int main() {
   const bool save_gif = true;               // 开启/关闭 GIF 生成
   const int gif_fps   = 30;                 // 帧率
   const std::string frames_dir = "anim_frames"; // 相对运行目录（通常是 build/）
-  const std::string gif_out   = "path_animation.gif";
+  const std::string frames_dir_cloud = "anim_frames_cloud"; // 点云版帧目录
+  const std::string gif_out       = "path_animation.gif";
+  const std::string gif_out_cloud = "path_animation_cloud.gif"; // 点云版 GIF
 
   // line-of-sight 剪枝（仿 ik_test astar.shortcut 配置：消阶梯锯齿）
   const bool   shortcut_enable     = true;
@@ -166,8 +195,9 @@ int main() {
   planner.step_pix   = step_pix;
   planner.yaw_step_bins = 1;
   planner.w_yaw = 20.0;  // 旋转代价：原地转 10° ≈ 平移 20px，强约束“尽量平移不旋转”
-  planner.w_clear    = 50.0;  // 远离障碍软惩罚权重：每行进 1px 每缺 1px 间隙罚 50
-                              // （1px 缺口 ≈ 2.5 次旋转）——量级远大于旋转，保证优先离障
+  planner.w_clear    = 50.0;  // 远离障碍软惩罚权重：外层点云逐点间隙缺失(d_safe-d_i)
+                              // 求和后，每行进 1px 罚 50×总和（点云求和量级 >> 单点，
+                              // 若路径过度绕远可调小此权重）
   planner.w_smooth   = 0.5;   // 平滑度惩罚：平移↔旋转动作每次切换罚 0.5（轻微抑制频繁切换），
                               // 量级远低于旋转与离障
   planner.w_time     = 10.0;  // 完成时间惩罚：平移 1px 罚 10、旋转一档罚 200（w_yaw=20 等效时间），
@@ -254,39 +284,57 @@ int main() {
   cv::imwrite("final_state.png", final_img);
   std::cout << "[png] 已保存结束状态: final_state.png" << std::endl;
 
-  // —— 生成动画帧（时间插值：沿路径恒速均匀回放）——
+  // —— 生成动画帧（时间插值：沿路径恒速均匀回放，双版本同步出帧）——
   if (save_gif) {
-    clearOldFrames(frames_dir); // 先清掉上次运行残留的旧帧，避免 GIF 结尾混入旧画面
-    if (!ensureDir(frames_dir)) {
-      std::cerr << "[gif] 无法创建目录：" << frames_dir << std::endl;
+    clearOldFrames(frames_dir);       // 先清掉上次运行残留的旧帧，避免 GIF 结尾混入旧画面
+    clearOldFrames(frames_dir_cloud);
+    if (!ensureDir(frames_dir) || !ensureDir(frames_dir_cloud)) {
+      std::cerr << "[gif] 无法创建目录：" << frames_dir << " / "
+                << frames_dir_cloud << std::endl;
     } else {
       int frame_idx = 0;
-      cv::Mat frame;
+      cv::Mat frame, frame_c;
       // 插值速率上限：平移每帧 ≤1px，旋转每帧 ≤rot_cap_deg 度（与原逐节点回放观感一致）
       const double rot_cap_deg = 1.0;
       const double deg_per_bin = 360.0 / planner.theta_bins;
 
-      // 存一帧：已走完整段 + 当前段的部分线（剪枝后节点稀疏，段内插值逐步生长）
-      auto emitFrame = [&](size_t seg, double px, double py, double yaw) {
-        frame = base.clone();
+      // 画从起点到当前插值点的已走轨迹
+      auto drawTrail = [&](cv::Mat& f, size_t seg, int ix, int iy) {
         for (size_t i=1; i<=seg; ++i) {
-          cv::line(frame,
+          cv::line(f,
                    {path[i-1].x(), path[i-1].y()},
                    {path[i].x(),   path[i].y()},
                    {0,0,255}, 2);
         }
-        const int ix = (int)std::lround(px), iy = (int)std::lround(py);
         if (seg > 0) {
-          cv::line(frame, {path[seg-1].x(), path[seg-1].y()}, {ix, iy},
+          cv::line(f, {path[seg-1].x(), path[seg-1].y()}, {ix, iy},
                    {0,0,255}, 2);
         }
-        // 当前插值状态画机器人形状（描边）
+      };
+
+      // 存一帧（两个版本同编号）：已走完整段 + 当前段的部分线
+      //（剪枝后节点稀疏，段内插值逐步生长）
+      auto emitFrame = [&](size_t seg, double px, double py, double yaw) {
+        const int ix = (int)std::lround(px), iy = (int)std::lround(py);
+        char namebuf[256];
+
+        // 版本一：描边形状（与现有边线一致）
+        frame = base.clone();
+        drawTrail(frame, seg, ix, iy);
         drawAgentAt(frame, agent, yaw, ix, iy,
                     gm.meter_per_pixel, /*color=*/{50,180,255}, /*thick=*/2);
-        // 保存 PNG 帧（零填充编号以保证字典序）
-        char namebuf[256];
-        std::snprintf(namebuf, sizeof(namebuf), "%s/frame_%05d.png", frames_dir.c_str(), frame_idx++);
+        std::snprintf(namebuf, sizeof(namebuf), "%s/frame_%05d.png", frames_dir.c_str(), frame_idx);
         cv::imwrite(namebuf, frame);
+
+        // 版本二：外层连通离散点云（无边线）
+        frame_c = base.clone();
+        drawTrail(frame_c, seg, ix, iy);
+        drawAgentCloudAt(frame_c, agent, yaw, ix, iy, gm.meter_per_pixel,
+                         /*color=*/{50,180,255});
+        std::snprintf(namebuf, sizeof(namebuf), "%s/frame_%05d.png", frames_dir_cloud.c_str(), frame_idx);
+        cv::imwrite(namebuf, frame_c);
+
+        ++frame_idx;
       };
 
       emitFrame(0, path[0].x(), path[0].y(),
@@ -311,19 +359,22 @@ int main() {
         }
       }
 
-      // 合成为 GIF
-      if (makeGifFromPngs(frames_dir, gif_out, gif_fps)) {
-        std::cout << "[gif] 已生成 GIF: " << gif_out << std::endl;
-      } else {
+      // 合成为 GIF（两版各自合成）
+      const bool ok1 = makeGifFromPngs(frames_dir, gif_out, gif_fps);
+      const bool ok2 = makeGifFromPngs(frames_dir_cloud, gif_out_cloud, gif_fps);
+      if (ok1) std::cout << "[gif] 已生成 GIF: " << gif_out << std::endl;
+      if (ok2) std::cout << "[gif] 已生成 GIF: " << gif_out_cloud << std::endl;
+      if (!ok1 || !ok2) {
         std::cout << "[gif] 未自动生成 GIF。你可手动执行（任选其一）:\n"
                      "  ffmpeg -y -framerate " << gif_fps
-                  << " -i " << frames_dir << "/frame_%05d.png "
+                  << " -i <帧目录>/frame_%05d.png "
                      "-filter_complex \"fps=" << gif_fps
-                  << ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse\" "
-                  << gif_out << "\n"
+                  << ",split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse\" <输出GIF>\n"
                      "或：\n"
                      "  convert -delay " << (100/gif_fps)
-                  << " -loop 0 " << frames_dir << "/frame_*.png " << gif_out << "\n";
+                  << " -loop 0 <帧目录>/frame_*.png <输出GIF>\n"
+                     "帧目录/输出GIF：" << frames_dir << " -> " << gif_out
+                  << "；" << frames_dir_cloud << " -> " << gif_out_cloud << "\n";
       }
     }
   }

@@ -95,9 +95,29 @@ struct AnyShapeAStar {
   // 数值上与原 fillPoly+minMaxIdx 逐位一致（同一掩膜构造），不改变搜索结果
   struct BinFootprint {
     cv::Mat mask;        // CV_8UC1 实心足迹（bbox 局部坐标）
+    std::vector<cv::Point> contour; // 外层连通轮廓离散点云（bbox 局部坐标，不含孔洞边界）
     cv::Point org;       // 形状中心（局部原点）在掩膜内的位置
     bool ready{false};
   };
+
+  // 轮廓点云抽稀：贪心保留，删除与已保留点邻近（切比雪夫距离 ≤ min_gap）的像素
+  static std::vector<cv::Point> thinContour(const std::vector<cv::Point>& pts,
+                                            int min_gap = 1) {
+    std::vector<cv::Point> out;
+    out.reserve(pts.size() / 2 + 1);
+    for (const auto& p : pts) {
+      bool near = false;
+      for (const auto& q : out) {
+        if (std::max(std::abs(p.x - q.x), std::abs(p.y - q.y)) <= min_gap) {
+          near = true;
+          break;
+        }
+      }
+      if (!near) out.push_back(p);
+    }
+    return out;
+  }
+
   std::vector<BinFootprint> fp_;
   // 性能计数（供基准测试观察，不影响结果）
   long long n_clr_calls{0}, n_clr_pix{0};
@@ -126,6 +146,13 @@ struct AnyShapeAStar {
       cv::fillPoly(m, holev, cv::Scalar(0));
     }
     f.mask = m;
+    // 外层连通轮廓的全部像素（RETR_EXTERNAL 不含孔洞边界，CHAIN_APPROX_NONE
+    // 保留每个边界像素）：离障软惩罚的边缘点云
+    std::vector<std::vector<cv::Point>> cs;
+    cv::findContours(m.clone(), cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    f.contour.clear();
+    for (auto& c : cs) f.contour.insert(f.contour.end(), c.begin(), c.end());
+    f.contour = thinContour(f.contour); // 删除邻近像素，得到离散点云
     f.org  = cv::Point(-bbox.x, -bbox.y);
     f.ready = true;
   }
@@ -295,12 +322,24 @@ struct AnyShapeAStar {
       // 同一状态被多个父节点 push 时，若基础代价已不可能更优，可安全跳过碰撞评估
       if (nodes[id].opened && ng_base >= nodes[id].g_base) return;
 
-      // 足迹到最近障碍的最小间隙：<=0 碰撞；同时作为“远离障碍”软惩罚
+      // 足迹到最近障碍的最小间隙：<=0 碰撞（整体实心掩膜判定，含孔洞与越界）
       const double clr = clearance(nx,ny,nth);
       if (clr <= 0.0) return;
+      // 软惩罚：外层连通轮廓的离散点云逐点查距离场，各点独立计算
+      // max(0, d_safe - d_i) 后求和（贴障的边缘越多罚越重）
+      // （clr >= d_safe 时所有点间隙均 >= d_safe，惩罚必为 0，跳过点云遍历）
+      double pen = 0.0;
+      if (clr < d_safe_pix) {
+        const BinFootprint& f = fp_[nth]; // clearance() 已构建该档足迹
+        const int px0 = nx - f.org.x, py0 = ny - f.org.y;
+        for (const auto& p : f.contour) {
+          const float d = gm.dist.ptr<float>(py0 + p.y)[px0 + p.x];
+          if (d < d_safe_pix) pen += d_safe_pix - (double)d;
+        }
+      }
       // 惩罚按行进距离累计（乘 step_pix），保证总代价与步长无关，
       // 否则步长变小时节点数增多会放大惩罚、扭曲最优策略
-      const double ng = ng_base + w_clear * step_pix * std::max(0.0, d_safe_pix - clr);
+      const double ng = ng_base + w_clear * step_pix * pen;
 
       double nf = ng + heuristic(nx,ny,goal.x(),goal.y(),nth,goal.z());
       if (!nodes[id].opened || ng < nodes[id].g) {
