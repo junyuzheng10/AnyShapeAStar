@@ -31,16 +31,9 @@ struct AnyShapeAStar {
   int    theta_bins{36};
   double step_pix{5.0};      // 机器人更大 -> 步长略大
   double yaw_step_bins{1};
-  double w_yaw{0.010};        // 角度权重
   double w_clear{0.5};        // 远离障碍软惩罚权重（间隙每缺 1px 罚 w_clear）
-  double w_smooth{0.0};       // 平滑度惩罚：平移↔旋转动作每次切换罚 w_smooth
-  double w_time{1.0};         // 完成时间惩罚：基础运动时间（平移 1px、旋转一档=w_yaw 等效 px）
-                              // 按 w_time 加权；“最快完成”须主导所有软惩罚、但低于离障量级
-  double w_dir{0.0};          // x/y 运动惯性：连续平移方向切换罚 w_dir（量级须低于离障/旋转）
-  double w_line{0.0};         // 线段吸引：偏离“起点→终点连线”垂距每行进 1px 罚 w_line*垂距
-                              // （量级介于离障与惯性之间：拉直轨迹，避障优先级更高）
-  double w_pose{0.0};         // 非期望姿态惩罚：偏离期望 yaw 每 bin 每行进 1px 罚 w_pose
-  int    th_des{0};           // 期望姿态（yaw bin，通常为直立 0）
+  double w_dir{0.0};          // x/y 运动惯性：连续平移方向切换、原地旋转每档各罚 w_dir
+                              // （旋转不打断平移惯性，方向继承父节点；量级须低于离障）
   double d_safe_pix{10.0};    // 期望安全间隙（像素），间隙低于此值才产生惩罚
   int    th_lo{0};            // 允许的最小 yaw bin（含）
   int    th_hi{35};           // 允许的最大 yaw bin（含）；th_lo > th_hi 表示窗口跨 0 环绕
@@ -82,9 +75,6 @@ struct AnyShapeAStar {
     x = id % gm.W;
     y = (id / gm.W) % gm.H;
     th = thOfRank(id / (gm.W * gm.H));
-  }
-  inline bool samePos(int a, int b) const {
-    return (a % gm.W) == (b % gm.W) && ((a / gm.W) % gm.H) == ((b / gm.W) % gm.H);
   }
 
   // ===== C-space 预计算（加速碰撞查询）=====
@@ -187,14 +177,10 @@ struct AnyShapeAStar {
     return minD;
   }
 
-  inline double heuristic(int x,int y,int gx,int gy,int th,int gth) const {
+  inline double heuristic(int x,int y,int gx,int gy) const {
     double dx=x-gx, dy=y-gy;
-    double d = std::sqrt(dx*dx+dy*dy);
-    double yaw = yawOf(th), gyaw = yawOf(gth);
-    double dth = std::atan2(std::sin(yaw-gyaw), std::cos(yaw-gyaw));
-    // 角度项下界：至少需要 |dth|/(2π/theta_bins) 次原地旋转，每次代价 w_yaw
-    // （与代价同步按 w_time 缩放，保持时间目标下的可采纳下界）
-    return w_time * (d + w_yaw*std::abs(dth)*(static_cast<double>(theta_bins)/(2.0*M_PI)));
+    // 纯几何引导项：仅欧氏距离（角度项已去除）
+    return std::sqrt(dx*dx+dy*dy);
   }
 
   // ===== line-of-sight 剪枝（仿 ik_test astar_cart_interp_demo.shortcut_path）=====
@@ -248,17 +234,13 @@ struct AnyShapeAStar {
       Eigen::Vector3i start,
       Eigen::Vector3i goal)
   {
-    // 起点若碰撞（间隙为 0），直接失败
-    if (clearance(start.x(), start.y(), start.z()) <= 0.0)
+    // 起点校验：姿态须在 yaw 窗口内（否则 rankOf 越界），且碰撞（间隙为 0）直接失败
+    if (!thAllowed(start.z()) ||
+        clearance(start.x(), start.y(), start.z()) <= 0.0)
       return {};
 
     const int N = gm.W * gm.H * nRanks();
     std::vector<Node> nodes(N);
-
-    // 线段吸引约束的参考线：起点→终点连线（按点到线段垂距计算）
-    const double line_x0 = start.x(), line_y0 = start.y();
-    const double line_dx = goal.x() - start.x(), line_dy = goal.y() - start.y();
-    const double line_len2 = line_dx * line_dx + line_dy * line_dy;
 
     auto recPath = [&](int id){
       std::vector<Eigen::Vector3i> path;
@@ -279,8 +261,8 @@ struct AnyShapeAStar {
       int id = idx(nx,ny,nth);
       if (nodes[id].closed) return;
 
-      // x/y 运动惯性：连续平移方向切换罚 w_dir（旋转不打断惯性，方向继承父节点；
-      // 量级低于离障/旋转，仅轻微鼓励直线平移）
+      // x/y 运动惯性：连续平移方向切换罚 w_dir；原地旋转每档也罚 w_dir
+      // （旋转不打断平移惯性，方向继承父节点；量级低于离障/旋转时间代价）
       signed char new_dir = 0;
       if (nx != px || ny != py) {  // 本动作为平移
         new_dir = (nx > px) ? 1 : (nx < px) ? 2 : (ny > py) ? 3 : 4;
@@ -288,34 +270,8 @@ struct AnyShapeAStar {
           const signed char pdir = nodes[pidx].dir;
           if (pdir > 0 && pdir != new_dir) ng_base += w_dir;
         }
-      }  // end 本动作为平移
-
-      // x/y 趋于终端期望（与 yaw 期望姿态 th_des 惩罚同构）：
-      // 每步按当前位置到“起点→终点连线”的垂距直接罚 w_line，不做行进距离累积；
-      // 平移与旋转动作均生效（“总是趋于终端期望”），量级介于离障与惯性之间
-      if (w_line > 0.0 && line_len2 > 0.0) {
-        const double wx = nx - line_x0, wy = ny - line_y0;
-        double t = (wx * line_dx + wy * line_dy) / line_len2;
-        t = std::max(0.0, std::min(1.0, t));
-        const double dlx = wx - t * line_dx, dly = wy - t * line_dy;
-        ng_base += w_line * std::sqrt(dlx * dlx + dly * dly);
-      }
-
-      // 平滑度惩罚：平移↔旋转动作切换
-      // （当前动作是否旋转：目标与父位置重合；父的动作是否旋转：父与其父位置重合）
-      if (w_smooth > 0.0 && pidx >= 0) {
-        const Node& p = nodes[pidx];
-        const bool cur_is_rot = (p.parent >= 0 && samePos(pidx, p.parent));
-        const bool new_is_rot = (nx == px && ny == py);
-        if (cur_is_rot != new_is_rot) ng_base += w_smooth;
-      }
-
-      // 非期望姿态惩罚：偏离期望 yaw 每 bin 每行进 1px 罚 w_pose
-      // （按步长折算保持步长无关；驱使规划器只在必要时偏离期望姿态、且尽快回到期望姿态）
-      if (w_pose > 0.0) {
-        int dth = std::abs(nth - th_des);
-        dth = std::min(dth, theta_bins - dth);  // bin 环绕
-        if (dth > 0) ng_base += w_pose * step_pix * dth;
+      } else if (w_dir > 0.0 && pidx >= 0) {  // 本动作为原地旋转
+        ng_base += w_dir;
       }
 
       // 去重：离障惩罚只依赖状态 (nx,ny,nth) 本身，故 g = g_base + penalty。
@@ -341,7 +297,7 @@ struct AnyShapeAStar {
       // 否则步长变小时节点数增多会放大惩罚、扭曲最优策略
       const double ng = ng_base + w_clear * step_pix * pen;
 
-      double nf = ng + heuristic(nx,ny,goal.x(),goal.y(),nth,goal.z());
+      double nf = ng + heuristic(nx,ny,goal.x(),goal.y());
       if (!nodes[id].opened || ng < nodes[id].g) {
         nodes[id].opened = true;
         nodes[id].g = ng; nodes[id].g_base = ng_base; nodes[id].f = nf;
@@ -360,7 +316,7 @@ struct AnyShapeAStar {
     nodes[sid].g=0.0;
     nodes[sid].g_base=0.0;
     nodes[sid].parent=-1;
-    nodes[sid].f=heuristic(start.x(),start.y(),goal.x(),goal.y(),start.z(),goal.z());
+    nodes[sid].f=heuristic(start.x(),start.y(),goal.x(),goal.y());
     pq.push({nodes[sid].f, sid});
 
     // 六种邻居动作（世界系控制，位移与 yaw 解耦）：±x 平移、±y 平移、原地 yaw ±1 bin
@@ -376,25 +332,26 @@ struct AnyShapeAStar {
 
       int cx, cy, cth; decode(id, cx, cy, cth);
 
-      // 抵达判定：靠近位置 & 角度接近
+      // 抵达判定：靠近位置 & 角度接近（bin 环绕距离，35↔0 视为相邻）
       double dx=cx-goal.x(), dy=cy-goal.y();
-      if (std::sqrt(dx*dx+dy*dy) <= step_pix*1.5 &&
-          (std::abs(cth-goal.z()) % theta_bins) <= 1) {
+      const int dth_goal = std::abs(((cth - goal.z() + theta_bins + theta_bins/2)
+                                     % theta_bins) - theta_bins/2);
+      if (std::sqrt(dx*dx+dy*dy) <= step_pix*1.5 && dth_goal <= 1) {
         return recPath(id);
       }
 
       // 扩展动作
       for (int k=0;k<6;++k){
+        // 平移方向硬约束：dx 必须朝目标 x 方向或为 0（不允许远离目标的 x 位移，
+        // 零代价平台上以此保证向目标推进）；dx=0 的平移与旋转不受限
+        if (dxs[k] != 0 &&
+            (goal.x() > cx) - (goal.x() < cx) != dxs[k]) continue;
         int nth = ( (cth + (int)std::round(dths[k]*yaw_step_bins)) % theta_bins + theta_bins ) % theta_bins;
         // 世界系位移：直接沿 ±x / ±y 平移，与朝向无关
         int nx = cx + static_cast<int>(std::round(dxs[k]*step_pix));
         int ny = cy + static_cast<int>(std::round(dys[k]*step_pix));
-        double travel = (dxs[k] != 0 || dys[k] != 0) ? step_pix : 0.0;
-        double turn_pen = (dxs[k] == 0 && dys[k] == 0) ? 1.0 : 0.0; // 原地旋转稍贵
-        // 完成时间惩罚：动作等效时间（平移 1px；旋转一档 ≈ w_yaw px 等效时间）按 w_time 加权
-        double time_cost = travel + turn_pen * w_yaw;
-        double ng = cur.g + w_time * time_cost;
-        pushOrRelax(nx,ny,nth,ng, id, cx,cy, pq);
+        // 运动本身零代价：g 仅由各软惩罚（离障/惯性/姿态）构成
+        pushOrRelax(nx,ny,nth,cur.g, id, cx,cy, pq);
       }
     }
     return {}; // 无解

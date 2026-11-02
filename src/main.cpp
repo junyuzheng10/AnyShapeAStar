@@ -195,26 +195,15 @@ int main() {
   planner.theta_bins = theta_bins;
   planner.step_pix   = step_pix;
   planner.yaw_step_bins = 1;
-  planner.w_yaw = 20.0;  // 旋转代价：原地转 10° ≈ 平移 20px，强约束“尽量平移不旋转”
   planner.w_clear    = 50.0;  // 远离障碍软惩罚权重：外层点云逐点间隙缺失(d_safe-d_i)
                               // 求和后，每行进 1px 罚 50×总和（点云求和量级 >> 单点，
                               // 若路径过度绕远可调小此权重）
-  planner.w_smooth   = 0.5;   // 平滑度惩罚：平移↔旋转动作每次切换罚 0.5（轻微抑制频繁切换），
-                              // 量级远低于旋转与离障
-  planner.w_time     = 10.0;  // 完成时间惩罚：平移 1px 罚 10、旋转一档罚 200（w_yaw=20 等效时间），
-                              // “最快完成”主导所有软惩罚；量级低于离障(50/px)
-  planner.w_dir      = 2.0;   // x/y 运动惯性：连续平移方向切换罚 2（≈平移 2px），
-                              // 鼓励直线平移；量级低于旋转(20)与离障(50/px)
-  planner.w_line     = 5.0;   // x/y 趋于终端期望（与 yaw 期望姿态惩罚同构）：每步按偏离
-                              // “起点→终点连线”的垂距直接罚 5（1px 偏离=5，2px≈一次旋转），
-                              // 强度大于惯性(2/次)、远小于离障(50/px)
-  planner.w_pose     = 1.0;   // 非期望姿态惩罚：偏离期望姿态（直立）每 bin 每行进 1px 罚 1，
-                              // 驱使物体只在必要时倾斜、且尽快回正（低于旋转量级）
-  planner.th_des     = 0;     // 期望姿态：直立（th=0）
-  planner.d_safe_pix = 10.0;  // 期望安全间隙 10px = 0.5m
-  // yaw 边界：只允许 [-40°, +40°]（bin 32..35 = -40°..-10°，0..4 = 0..+40°），防止无限旋转
-  planner.th_lo = theta_bins - 4;   // 32
-  planner.th_hi = 4;
+  planner.w_dir      = 2.0;   // x/y 运动惯性：连续平移方向切换、原地旋转每档各罚 2（≈平移 2px），
+                              // 鼓励直线平移、抑制频繁旋转；量级低于离障(50/px)
+  planner.d_safe_pix = 20.0;  // 期望安全间隙 20px = 1.0m
+  // yaw 边界：只允许 [-80°, +80°]（bin 28..35 = -80°..-10°，0..8 = 0..+80°），防止无限旋转
+  planner.th_lo = theta_bins - 8;   // 28
+  planner.th_hi = 8;
   planner.visualize_expand = false; // 只显示最终结果
 
   // ===== 起终点 =====
@@ -301,7 +290,7 @@ int main() {
 
       // 画从起点到当前插值点的已走轨迹
       auto drawTrail = [&](cv::Mat& f, size_t seg, int ix, int iy) {
-        for (size_t i=1; i<=seg; ++i) {
+        for (size_t i=1; i<seg; ++i) {  // 只画已走完整段；当前段由下方部分线绘制
           cv::line(f,
                    {path[i-1].x(), path[i-1].y()},
                    {path[i].x(),   path[i].y()},
