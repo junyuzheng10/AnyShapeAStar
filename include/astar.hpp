@@ -40,6 +40,8 @@ struct AnyShapeAStar {
   int    pen_top_k{0};        // 软惩罚只取离障碍最近的 K 个点求和；0 = 全部点求和
   int    th_lo{0};            // 允许的最小 yaw bin（含）
   int    th_hi{35};           // 允许的最大 yaw bin（含）；th_lo > th_hi 表示窗口跨 0 环绕
+  int    x_min{-1}, x_max{-1};   // x 搜索范围剪枝（像素，含端点；-1 = 不限制）
+  int    y_min{-1}, y_max{-1};   // y 搜索范围剪枝（像素，含端点；-1 = 不限制）
   bool   visualize_expand{false}; // 本工程仅最终路径显示
 
   AnyShapeAStar(const GridMap& map, const PolygonalShape& sh)
@@ -258,6 +260,9 @@ struct AnyShapeAStar {
                            int pidx, int px, int py,
                            std::priority_queue<PQItem>& pq){
       if(!gm.inBounds(nx,ny) || !thAllowed(nth)) return;  // 地图边界 + yaw 边界剪枝
+      // x/y 搜索范围剪枝（-1 = 不限制）
+      if (x_min >= 0 && (nx < x_min || nx > x_max)) return;
+      if (y_min >= 0 && (ny < y_min || ny > y_max)) return;
       int id = idx(nx,ny,nth);
       if (nodes[id].closed) return;
 

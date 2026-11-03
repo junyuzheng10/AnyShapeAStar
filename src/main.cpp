@@ -174,6 +174,11 @@ int main() {
                                            /*rect_x0=*/1.5, /*rect_h=*/0.9,
                                            /*box_x0=*/4.0, /*box_x1=*/6.4, /*box_h=*/1.8,
                                            /*t=*/0.1);
+    // 平移形状原点到竖杆中心：杆中心相对原点偏移 (mast_w/2, (h_below-h_above)/2)
+    // = (0.25m, -0.225m)，平移后起点状态即竖杆几何中心
+    const double dx_c = -0.5/2, dy_c = (1.05 - 1.50)/2 * -1.0;
+    for (auto& p : agent.outer_m_)  { p.x() += dx_c; p.y() += dy_c; }
+    for (auto& h : agent.holes_m_) for (auto& p : h) { p.x() += dx_c; p.y() += dy_c; }
   } else if (shape_choice == ShapeChoice::VehicleShape) {
     // 车辆侧影（0.7 倍等比缩小，保证 60px 走廊内几何可解）：
     // 车长 7.7m(154px)、尾鳍 1.89m(37.8px)、车体高 1.4m(28px)、笔画 0.21m
@@ -202,19 +207,23 @@ int main() {
   planner.w_dir      = 2.0;   // x/y 运动惯性：连续平移方向切换、原地旋转每档(2°)各罚 2（≈平移 2px），
                               // 鼓励直线平移、抑制频繁旋转；量级低于离障(500/px)
   planner.d_safe_pix = 5.0;   // 期望安全间隙 5px = 0.25m
-  planner.pen_top_k  = 10;    // 软惩罚只累加离障碍最近的 10 个点的缺失量
-                              //（其余贴障点不计，抑制长贴障段惩罚随点数线性膨胀）
-  // yaw 边界：只允许 [-80°, +80°]（bin 140..179 = -80°..-2°，0..40 = 0..+80°），防止无限旋转
-  planner.th_lo = theta_bins - 40;  // 140
+  planner.pen_top_k  = 0;     // 0 = 全部边缘点云逐点求和缺失量(d_safe-d_i)，再乘惩罚权重累加
+  // yaw 边界：只允许 [0°, +80°]（bin 0..40 = 0..+80°），负方向姿态全部剪枝
+  planner.th_lo = 0;                // yaw 窗口 [0°, +80°]（bin 0..40 = 0..+80°）
   planner.th_hi = 40;
   planner.visualize_expand = false; // 只显示最终结果
 
   // ===== 起终点 =====
-  // 起点：竖线下端贴合下墙（下墙顶缘 y=285）。线高 42px，中心 y=263 时
-  // 线段占据 y∈[242,284]，最下沿像素紧邻墙面（间隙 1px，视觉上接触；
-  // 规划器将间隙=0 判为碰撞，故取 1px）
-  Eigen::Vector3i start(60, 263, 0);
+  // 起点 = 竖杆几何中心（形状原点已平移到杆中心）。杆占 x∈[60,70]、y∈[234,284]，
+  // 下缘 284 与下墙顶缘 285 间隙 1px（间隙=0 判为碰撞，故取 1px）
+  Eigen::Vector3i start(65, 259, 0);
   Eigen::Vector3i goal (560, 255, 0); // 驶出豁口后的停车点（不得超出地图）
+
+  // x/y 搜索范围剪枝：x 从起点到终点之后再多 10cm（2px）；y 限起点 ±200px
+  planner.x_min = start.x();
+  planner.x_max = goal.x() + 2;
+  planner.y_min = start.y() - 200;
+  planner.y_max = start.y() + 200;
 
   // ===== 规划（仅统计纯规划耗时，不含可视化/图片生成）=====
   const auto t0 = std::chrono::steady_clock::now();
