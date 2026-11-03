@@ -42,6 +42,8 @@ struct AnyShapeAStar {
   int    th_hi{35};           // 允许的最大 yaw bin（含）；th_lo > th_hi 表示窗口跨 0 环绕
   int    x_min{-1}, x_max{-1};   // x 搜索范围剪枝（像素，含端点；-1 = 不限制）
   int    y_min{-1}, y_max{-1};   // y 搜索范围剪枝（像素，含端点；-1 = 不限制）
+  double w_mid{0.0};          // 中线贴合软惩罚权重：控制点 y 每偏离该列上下障碍
+                              // 中线（蓝色线段）1px 罚 w_mid；无中线的列不计
   bool   visualize_expand{false}; // 本工程仅最终路径显示
 
   AnyShapeAStar(const GridMap& map, const PolygonalShape& sh)
@@ -277,6 +279,13 @@ struct AnyShapeAStar {
         }
       } else if (w_dir > 0.0 && pidx >= 0) {  // 本动作为原地旋转
         ng_base += w_dir;
+      }
+
+      // 中线贴合软惩罚：控制点 y 到该列上下障碍中线（蓝色线段）的绝对距离，
+      // 乘 step_pix 与离障惩罚同规则按行进距离累计；该列无中线时不计
+      if (w_mid > 0.0) {
+        const int my = gm.mid_y[nx];
+        if (my >= 0) ng_base += w_mid * step_pix * std::abs(ny - my);
       }
 
       // 去重：离障惩罚只依赖状态 (nx,ny,nth) 本身，故 g = g_base + penalty。

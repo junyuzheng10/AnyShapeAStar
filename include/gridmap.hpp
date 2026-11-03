@@ -11,6 +11,29 @@ struct GridMap {
   double meter_per_pixel{0.05};    // 5 cm / pixel
   cv::Mat occ;                     // 占据图
   cv::Mat dist;                    // 距离场：每个空闲像素到最近障碍的 L2 距离（像素）
+  std::vector<int> mid_y;          // 每列上下障碍的缝隙中线 y（-1 = 该列无对应中线）
+
+  // 逐列取上方障碍连续段下缘与下方障碍连续段上缘的中点（即可视化中的蓝色线段）
+  void computeMidY()
+  {
+    mid_y.assign(W, -1);
+    for (int x = 0; x < W; ++x) {
+      const uchar* col = occ.ptr<uchar>(0) + x;  // 逐列访问（行 stride = W）
+      int top_end = -1;                          // 上方障碍连续段的下缘
+      for (int y = 0; y < H; ++y) {
+        if (col[y * W]) top_end = y;
+        else if (top_end >= 0) break;            // 连续段结束
+      }
+      if (top_end < 0) continue;                 // 该列上方无障碍
+      int bot_end = -1;                          // 下方障碍连续段的上缘
+      for (int y = H - 1; y >= 0; --y) {
+        if (col[y * W]) bot_end = y;
+        else if (bot_end >= 0) break;
+      }
+      if (bot_end < 0 || bot_end <= top_end) continue; // 下方无障碍或无自由间隙
+      mid_y[x] = (int)std::lround((top_end + bot_end) / 2.0);
+    }
+  }
 
   GridMap(int w, int h, double mpp)
     : W(w), H(h), meter_per_pixel(mpp), occ(h, w, CV_8UC1, cv::Scalar(0)) {}

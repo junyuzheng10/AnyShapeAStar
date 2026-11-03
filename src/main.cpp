@@ -129,7 +129,8 @@ static bool makeGifFromPngs(const std::string& frames_dir,
 int main() {
   // ===== 参数设置 =====
   const ShapeChoice shape_choice = ShapeChoice::VLineShape; // VLine / Vehicle / L / F / A
-  const int W = 800, H = 500;
+  const int W = 900, H = 500;   // 画布加宽到 900：横线加长到 15m 后，终点 (560) 处
+                                // 足迹伸至 x≈861，需 < W 才不因越界被判碰撞
   const double mpp = 0.05;      // 5 cm / pixel
   const int theta_bins = 180;   // 2°（旋转单步 1 bin = 2°）
   const double step_pix = 1.0;  // 单次递进 1px（更精细，求解时间相应变长）
@@ -160,6 +161,7 @@ int main() {
   gm.addRect(360, 273,   6, 12);   // 凸出块（273 → 285）
   // 走廊自由带：y ∈ (225, 285)，高 60px = 3.0m；凸块上方收窄为 48px
   gm.computeDistanceField(); // 预计算距离场：用于“远离障碍”软惩罚
+  gm.computeMidY();          // 预计算每列上下障碍中线（蓝色线段）：用于中线贴合软惩罚
 
 
   // ===== 机器人形状（放大）=====
@@ -167,9 +169,10 @@ int main() {
   if (shape_choice == ShapeChoice::VLineShape) {
     // 运动物体：竖杆（下段 1.05m、上段 1.5m、厚 0.5m=10px，总高 51px > 48px 窗口
     //          → 直立无法过缝；加厚后需后倾 ≥40° 缩短竖向投影，旋转成为必需动作）
-    //          + 右伸横线（长 7.5m）+ 横线上“低-高-低”空心轮廓：
-    //   矮矩形 0.9m 高贯通 1.5m→7.5m；中部加高框 1.8m 高（顶贴上墙）位于 4.0m→6.4m
-    agent = PolygonalShape::MakeVHLineHump(/*h_below=*/1.05, /*h_above=*/1.50, /*len=*/7.5,
+    //          + 右伸横线（长 15m：起点控制点 x=65，末端 65+300px=365 恰填满至
+    //            走廊右端最后一块墙体 x=365）+ 横线上“低-高-低”空心轮廓：
+    //   矮矩形 0.9m 高贯通 1.5m→15m；中部加高框 1.8m 高（顶贴上墙）位于 4.0m→6.4m
+    agent = PolygonalShape::MakeVHLineHump(/*h_below=*/1.05, /*h_above=*/1.50, /*len=*/15.0,
                                            /*mast_w=*/0.5,
                                            /*rect_x0=*/1.5, /*rect_h=*/0.9,
                                            /*box_x0=*/4.0, /*box_x1=*/6.4, /*box_h=*/1.8,
@@ -207,6 +210,7 @@ int main() {
   planner.w_dir      = 2.0;   // x/y 运动惯性：连续平移方向切换、原地旋转每档(2°)各罚 2（≈平移 2px），
                               // 鼓励直线平移、抑制频繁旋转；量级低于离障(500/px)
   planner.d_safe_pix = 5.0;   // 期望安全间隙 5px = 0.25m
+  planner.w_mid      = 50.0;  // 中线贴合软惩罚：控制点 y 每偏离蓝色中线 1px 罚 50（可调）
   planner.pen_top_k  = 0;     // 0 = 全部边缘点云逐点求和缺失量(d_safe-d_i)，再乘惩罚权重累加
   // yaw 边界：只允许 [0°, +80°]（bin 0..40 = 0..+80°），负方向姿态全部剪枝
   planner.th_lo = 0;                // yaw 窗口 [0°, +80°]（bin 0..40 = 0..+80°）
