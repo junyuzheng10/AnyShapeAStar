@@ -32,9 +32,12 @@ struct AnyShapeAStar {
   double step_pix{5.0};      // 机器人更大 -> 步长略大
   double yaw_step_bins{1};
   double w_clear{0.5};        // 远离障碍软惩罚权重（间隙每缺 1px 罚 w_clear）
+  double w_h{1.0};            // 启发式权重（Weighted A*）：f = g + w_h*h；>1 加速搜索、
+                              // 结果至多偏离最优 w_h 倍（求平滑初始轨迹时建议 3~5）
   double w_dir{0.0};          // x/y 运动惯性：连续平移方向切换、原地旋转每档各罚 w_dir
                               // （旋转不打断平移惯性，方向继承父节点；量级须低于离障）
   double d_safe_pix{10.0};    // 期望安全间隙（像素），间隙低于此值才产生惩罚
+  int    pen_top_k{0};        // 软惩罚只取离障碍最近的 K 个点求和；0 = 全部点求和
   int    th_lo{0};            // 允许的最小 yaw bin（含）
   int    th_hi{35};           // 允许的最大 yaw bin（含）；th_lo > th_hi 表示窗口跨 0 环绕
   bool   visualize_expand{false}; // 本工程仅最终路径显示
@@ -79,12 +82,13 @@ struct AnyShapeAStar {
 
   // ===== C-space 预计算（加速碰撞查询）=====
   // 每档姿态只做一次 fillPoly 预烘焙"实心足迹掩膜"（含外轮廓、扣除内孔），
-  // 之后 clearance() 查询 = 按掩膜行段扫描距离场取最小值：
-  //   - 碰撞（dist=0）提前退出，大多数被拒绝的状态只需扫几个像素
-  //   - 行段连续内存，顺序读取对缓存/SIMD 友好
-  // 数值上与原 fillPoly+minMaxIdx 逐位一致（同一掩膜构造），不改变搜索结果
+  // 之后 clearance() 查询 = 遍历掩膜的全边界像素（外轮廓 + 孔洞边界）查距离场取最小值：
+  //   - 距离场 1-Lipschitz ⇒ 掩膜内到障碍的最小距离必在边界像素取到，
+  //     与实心掩膜全像素扫描严格等价，但每步只查 ~数百点而非数千像素
+  //   - 碰撞（dist=0）提前退出，大多数被拒绝的状态只需查几个点
   struct BinFootprint {
-    cv::Mat mask;        // CV_8UC1 实心足迹（bbox 局部坐标）
+    cv::Mat mask;        // CV_8UC1 实心足迹（bbox 局部坐标，用于 bbox 尺寸与轮廓提取）
+    std::vector<cv::Point> full_contour; // 掩膜全边界像素（外轮廓+孔洞边界，未抽稀）：clearance 判定
     std::vector<cv::Point> contour; // 外层连通轮廓离散点云（bbox 局部坐标，不含孔洞边界）
     cv::Point org;       // 形状中心（局部原点）在掩膜内的位置
     bool ready{false};
@@ -136,8 +140,14 @@ struct AnyShapeAStar {
       cv::fillPoly(m, holev, cv::Scalar(0));
     }
     f.mask = m;
-    // 外层连通轮廓的全部像素（RETR_EXTERNAL 不含孔洞边界，CHAIN_APPROX_NONE
-    // 保留每个边界像素）：离障软惩罚的边缘点云
+    // 掩膜全边界像素（RETR_CCOMP = 外轮廓 + 孔洞边界，CHAIN_APPROX_NONE 保留
+    // 每个边界像素）：clearance 判定用——距离场 1-Lipschitz，实心区域最小距离
+    // 必在边界取到，遍历边界与全掩膜扫描严格等价
+    std::vector<std::vector<cv::Point>> all_cs;
+    cv::findContours(m.clone(), all_cs, cv::RETR_CCOMP, cv::CHAIN_APPROX_NONE);
+    f.full_contour.clear();
+    for (auto& c : all_cs) f.full_contour.insert(f.full_contour.end(), c.begin(), c.end());
+    // 外层连通轮廓的全部像素（RETR_EXTERNAL 不含孔洞边界）：离障软惩罚的边缘点云
     std::vector<std::vector<cv::Point>> cs;
     cv::findContours(m.clone(), cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
     f.contour.clear();
@@ -157,22 +167,11 @@ struct AnyShapeAStar {
         x0 + f.mask.cols > gm.W || y0 + f.mask.rows > gm.H)
       return 0.0;
     double minD = std::numeric_limits<double>::infinity();
-    for (int j = 0; j < f.mask.rows; ++j) {
-      const uchar* mrow = f.mask.ptr<uchar>(j);
-      const float* drow = gm.dist.ptr<float>(y0 + j);
-      int i = 0;
-      while (i < f.mask.cols) {
-        while (i < f.mask.cols && mrow[i] == 0) ++i;      // 跳过空白段
-        if (i >= f.mask.cols) break;
-        const int i0 = i;
-        while (i < f.mask.cols && mrow[i] != 0) ++i;      // 实心段
-        for (int k = i0; k < i; ++k) {
-          const float d = drow[x0 + k];
-          ++n_clr_pix;
-          if (d <= 0.0f) return 0.0;                      // 碰撞：提前退出
-          if (d < minD) minD = d;
-        }
-      }
+    for (const auto& p : f.full_contour) {
+      const float d = gm.dist.ptr<float>(y0 + p.y)[x0 + p.x];
+      ++n_clr_pix;
+      if (d <= 0.0f) return 0.0;                        // 碰撞：提前退出
+      if (d < minD) minD = d;
     }
     return minD;
   }
@@ -254,6 +253,7 @@ struct AnyShapeAStar {
     };
 
     // pidx: 父节点状态索引（-1 表示起点）；px,py: 父节点坐标
+    std::vector<double> deficits; // pen_top_k 模式的缺失量暂存（避免每步分配）
     auto pushOrRelax = [&](int nx,int ny,int nth,double ng_base,
                            int pidx, int px, int py,
                            std::priority_queue<PQItem>& pq){
@@ -282,22 +282,38 @@ struct AnyShapeAStar {
       const double clr = clearance(nx,ny,nth);
       if (clr <= 0.0) return;
       // 软惩罚：外层连通轮廓的离散点云逐点查距离场，各点独立计算
-      // max(0, d_safe - d_i) 后求和（贴障的边缘越多罚越重）
+      // max(0, d_safe - d_i)；pen_top_k>0 时只取离障碍最近的 pen_top_k 个点的
+      // 缺失量求和（其余点不计），0 = 全部求和
       // （clr >= d_safe 时所有点间隙均 >= d_safe，惩罚必为 0，跳过点云遍历）
       double pen = 0.0;
       if (clr < d_safe_pix) {
         const BinFootprint& f = fp_[nth]; // clearance() 已构建该档足迹
         const int px0 = nx - f.org.x, py0 = ny - f.org.y;
-        for (const auto& p : f.contour) {
-          const float d = gm.dist.ptr<float>(py0 + p.y)[px0 + p.x];
-          if (d < d_safe_pix) pen += d_safe_pix - (double)d;
+        if (pen_top_k > 0) {
+          // 收集间隙不足点的缺失量，nth_element 取最大的 pen_top_k 个求和
+          deficits.clear();
+          for (const auto& p : f.contour) {
+            const float d = gm.dist.ptr<float>(py0 + p.y)[px0 + p.x];
+            if (d < d_safe_pix) deficits.push_back(d_safe_pix - (double)d);
+          }
+          if ((int)deficits.size() > pen_top_k) {
+            std::nth_element(deficits.begin(), deficits.begin() + pen_top_k,
+                             deficits.end(), std::greater<double>());
+            deficits.resize(pen_top_k);
+          }
+          for (double v : deficits) pen += v;
+        } else {
+          for (const auto& p : f.contour) {
+            const float d = gm.dist.ptr<float>(py0 + p.y)[px0 + p.x];
+            if (d < d_safe_pix) pen += d_safe_pix - (double)d;
+          }
         }
       }
       // 惩罚按行进距离累计（乘 step_pix），保证总代价与步长无关，
       // 否则步长变小时节点数增多会放大惩罚、扭曲最优策略
       const double ng = ng_base + w_clear * step_pix * pen;
 
-      double nf = ng + heuristic(nx,ny,goal.x(),goal.y());
+      double nf = ng + w_h * heuristic(nx,ny,goal.x(),goal.y());
       if (!nodes[id].opened || ng < nodes[id].g) {
         nodes[id].opened = true;
         nodes[id].g = ng; nodes[id].g_base = ng_base; nodes[id].f = nf;
@@ -316,7 +332,7 @@ struct AnyShapeAStar {
     nodes[sid].g=0.0;
     nodes[sid].g_base=0.0;
     nodes[sid].parent=-1;
-    nodes[sid].f=heuristic(start.x(),start.y(),goal.x(),goal.y());
+    nodes[sid].f=w_h*heuristic(start.x(),start.y(),goal.x(),goal.y());
     pq.push({nodes[sid].f, sid});
 
     // 六种邻居动作（世界系控制，位移与 yaw 解耦）：±x 平移、±y 平移、原地 yaw ±1 bin

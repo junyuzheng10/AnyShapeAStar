@@ -131,7 +131,7 @@ int main() {
   const ShapeChoice shape_choice = ShapeChoice::VLineShape; // VLine / Vehicle / L / F / A
   const int W = 800, H = 500;
   const double mpp = 0.05;      // 5 cm / pixel
-  const int theta_bins = 36;    // 10°
+  const int theta_bins = 180;   // 2°（旋转单步 1 bin = 2°）
   const double step_pix = 1.0;  // 单次递进 1px（更精细，求解时间相应变长）
 
   // GIF 导出参数
@@ -143,21 +143,20 @@ int main() {
   const std::string gif_out_cloud = "path_animation_cloud.gif"; // 点云版 GIF
 
   // line-of-sight 剪枝（仿 ik_test astar.shortcut 配置：消阶梯锯齿）
-  const bool   shortcut_enable     = true;
+  const bool   shortcut_enable     = false;
   const double shortcut_margin_pix = 1.0;
 
    // ===== 地图 =====
   GridMap gm(W, H, mpp);
-  // 上下两道横墙从左边界伸入，右端折成竖干（┘/┴ 形），中间为水平走廊
+  // 上下两道横墙从左边界伸入，右端对齐 x=366，中间为水平走廊
+  // （上墙竖干、下墙竖干已删除；下墙竖着的凸出块保留，横着的多出段已删除）
   // 墙体厚度 6px（原 12px 减半）；走廊内缘 225/285 与凸块顶 273 保持不变，
-  // 因此走廊 60px 间隙、凸块上方 48px 窗口、起点贴墙约束均不受影响
-  // 上墙：横笔从左边界到 x=366，右端竖干向上到顶
+  // 走廊 60px 间隙、凸块上方 48px 窗口均不受影响
+  // 上墙：横笔从左边界到 x=366
   gm.addRect(  0, 219, 366,  6);   // 横笔（下缘 225 = 走廊顶，厚 6px）
-  gm.addRect(360,   0,   6, 219);  // 竖干
-  // 下墙：横笔从左边界到 x=378，竖干向下到底
-  gm.addRect(  0, 285, 378,  6);   // 横笔（上缘 285 = 走廊底，厚 6px）
-  gm.addRect(360, 291,   6, 209);  // 竖干（291 → 底）
-  // 下墙凸出：在竖干位置向上凸起至 y=273（上方仍留 48px 窗口），x 向宽度 6px
+  // 下墙：横笔从左边界到 x=366（原到 x=378，多出的横向突出段已删）
+  gm.addRect(  0, 285, 366,  6);   // 横笔（上缘 285 = 走廊底，厚 6px）
+  // 下墙凸出：在 x=360..366 处向上凸起至 y=273（上方留 48px 窗口），竖向凸起保留
   gm.addRect(360, 273,   6, 12);   // 凸出块（273 → 285）
   // 走廊自由带：y ∈ (225, 285)，高 60px = 3.0m；凸块上方收窄为 48px
   gm.computeDistanceField(); // 预计算距离场：用于“远离障碍”软惩罚
@@ -195,15 +194,19 @@ int main() {
   planner.theta_bins = theta_bins;
   planner.step_pix   = step_pix;
   planner.yaw_step_bins = 1;
-  planner.w_clear    = 50.0;  // 远离障碍软惩罚权重：外层点云逐点间隙缺失(d_safe-d_i)
-                              // 求和后，每行进 1px 罚 50×总和（点云求和量级 >> 单点，
+  planner.w_clear    = 500.0; // 远离障碍软惩罚权重：外层点云逐点间隙缺失(d_safe-d_i)
+                              // 求和后，每行进 1px 罚 500×总和（点云求和量级 >> 单点，
                               // 若路径过度绕远可调小此权重）
-  planner.w_dir      = 2.0;   // x/y 运动惯性：连续平移方向切换、原地旋转每档各罚 2（≈平移 2px），
-                              // 鼓励直线平移、抑制频繁旋转；量级低于离障(50/px)
-  planner.d_safe_pix = 20.0;  // 期望安全间隙 20px = 1.0m
-  // yaw 边界：只允许 [-80°, +80°]（bin 28..35 = -80°..-10°，0..8 = 0..+80°），防止无限旋转
-  planner.th_lo = theta_bins - 8;   // 28
-  planner.th_hi = 8;
+  planner.w_h        = 4.0;   // Weighted A*：f = g + 4h，加速搜索，结果至多偏离最优 4 倍
+                              // （初始轨迹可接受；1.0 = 恢复普通 A*）
+  planner.w_dir      = 2.0;   // x/y 运动惯性：连续平移方向切换、原地旋转每档(2°)各罚 2（≈平移 2px），
+                              // 鼓励直线平移、抑制频繁旋转；量级低于离障(500/px)
+  planner.d_safe_pix = 5.0;   // 期望安全间隙 5px = 0.25m
+  planner.pen_top_k  = 10;    // 软惩罚只累加离障碍最近的 10 个点的缺失量
+                              //（其余贴障点不计，抑制长贴障段惩罚随点数线性膨胀）
+  // yaw 边界：只允许 [-80°, +80°]（bin 140..179 = -80°..-2°，0..40 = 0..+80°），防止无限旋转
+  planner.th_lo = theta_bins - 40;  // 140
+  planner.th_hi = 40;
   planner.visualize_expand = false; // 只显示最终结果
 
   // ===== 起终点 =====
@@ -225,6 +228,27 @@ int main() {
   cv::cvtColor(gm.occ, base, cv::COLOR_GRAY2BGR);
   cv::circle(base, {start.x(),start.y()}, 4, {0,255,0}, cv::FILLED);
   cv::circle(base, {goal.x(),goal.y()},   4, {0,0,255}, cv::FILLED);
+
+  // —— 走廊 z 向中点标记：每列同时存在上下障碍物像素时（z 即图像 y 向），
+  //    取上方障碍连续段的下缘与下方障碍连续段的上缘的中点，画浅蓝色像素
+  //    （缝隙几何中心可视化，随 base 层进入所有输出图与动画帧）——
+  for (int x = 0; x < gm.W; ++x) {
+    const uchar* col = gm.occ.ptr<uchar>(0) + x;  // 逐列访问（行 stride = W）
+    int top_end = -1;                             // 上方障碍连续段的下缘
+    for (int y = 0; y < gm.H; ++y) {
+      if (col[y * gm.W]) top_end = y;
+      else if (top_end >= 0) break;               // 连续段结束
+    }
+    if (top_end < 0) continue;                    // 该列上方无障碍
+    int bot_end = -1;                             // 下方障碍连续段的上缘
+    for (int y = gm.H - 1; y >= 0; --y) {
+      if (col[y * gm.W]) bot_end = y;
+      else if (bot_end >= 0) break;
+    }
+    if (bot_end < 0 || bot_end <= top_end) continue; // 下方无障碍或无自由间隙
+    const int mid = (int)std::lround((top_end + bot_end) / 2.0);
+    base.at<cv::Vec3b>(mid, x) = {230, 216, 173};    // 浅蓝（RGB 173,216,230）
+  }
 
   // —— 初始状态 PNG（不论是否求解成功均输出）——
   {
